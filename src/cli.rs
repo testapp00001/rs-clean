@@ -53,4 +53,6 @@ pub enum Commands {
         #[arg(short = 'e', long = "exclude", value_delimiter = ',')]
         exclude: Vec<String>,
     },
+    /// Interactive Terminal UI
+    Tui,
 }

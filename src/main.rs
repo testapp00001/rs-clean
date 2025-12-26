@@ -1,6 +1,7 @@
 mod clean;
 mod cli;
 mod combine;
+mod tui;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -27,6 +28,11 @@ fn main() {
             exclude,
         } => {
             combine::combine_code(path, output.as_deref(), include, exclude);
+        }
+        Commands::Tui => {
+            if let Err(e) = tui::run_tui() {
+                eprintln!("Error running TUI: {}", e);
+            }
         }
     }
 }

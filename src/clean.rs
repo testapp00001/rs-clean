@@ -1,6 +1,10 @@
+use bytesize::ByteSize;
+use ignore::{WalkBuilder, WalkState};
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path};
-use walkdir::WalkDir;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CleanRule {
     folder_name: &'static str,
@@ -63,6 +67,22 @@ fn matches_indicator(parent: &Path, indicator: &str) -> bool {
     }
 }
 
+/// Calculate directory size using Rayon for parallelism
+fn calculate_size(path: &Path) -> u64 {
+    WalkBuilder::new(path)
+        .build()
+        .par_bridge()
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            if e.path().is_file() {
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 pub fn clean_projects(root: &Path, force: bool) {
     if !root.exists() {
         eprintln!("❌ Error: Path {:?} does not exist.", root);
@@ -80,72 +100,93 @@ pub fn clean_projects(root: &Path, force: bool) {
     println!("🔍 Scanning path: {:?}", root);
     if !force {
         println!("⚠️  DRY RUN: No folders will be deleted. Use --force to delete.\n");
+    } else {
+        println!("⚠️  DELETING MODE: Folders will be permanently removed.\n");
     }
 
-    let mut found_any = false;
-    let mut total_cleaned = 0;
+    let total_freed = Arc::new(AtomicU64::new(0));
+    let found_any = Arc::new(AtomicU64::new(0));
 
-    // Use a mutable walker so we can skip directories we've already handled
-    let mut walker = WalkDir::new(root).into_iter().filter_entry(|e| {
-        let name = e.file_name().to_str().unwrap_or("");
-        // Skip common hidden folders like .git to speed up scan
-        !name.starts_with('.') || name == ".venv"
-    });
+    // Parallel walker to check matches
+    WalkBuilder::new(root)
+        .threads(num_cpus::get())
+        .build_parallel()
+        .run(|| {
+            let total_freed = total_freed.clone();
+            let found_any = found_any.clone();
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
 
-    while let Some(entry) = walker.next() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("Error reading directory: {}", e);
-                continue;
-            }
-        };
+                let path = entry.path();
+                if path.is_dir() {
+                    let folder_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        let path = entry.path();
+                    for rule in CLEAN_RULES {
+                        if folder_name == rule.folder_name {
+                            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                            // We need to check if indicator exists.
+                            // Since we are inside a parallel walker, simple exists() check is fine,
+                            // but we should avoid expensive ops if possible.
+                            // matches_indicator is reasonably fast (stat check).
+                            let should_clean = match rule.project_indicator {
+                                Some(ind) => matches_indicator(parent, ind),
+                                None => true,
+                            };
 
-        if path.is_dir() {
-            let folder_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            if should_clean {
+                                found_any.fetch_add(1, Ordering::Relaxed);
 
-            for rule in CLEAN_RULES {
-                if folder_name == rule.folder_name {
-                    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                                // Calculate size before deleting (or just for reporting)
+                                let size = calculate_size(path);
+                                let size_str = ByteSize(size).to_string();
 
-                    let should_clean = match rule.project_indicator {
-                        Some(ind) => matches_indicator(parent, ind),
-                        None => true,
-                    };
-
-                    if should_clean {
-                        found_any = true;
-                        if force {
-                            print!("🗑️  Deleting {:?} ... ", path);
-                            // Important: Delete first, then skip descending
-                            match fs::remove_dir_all(path) {
-                                Ok(_) => {
-                                    println!("DONE");
-                                    total_cleaned += 1;
+                                if force {
+                                    // print! macro might interleave lines in parallel.
+                                    // For a CLI tool, usually line buffering handles it okay, but let's see.
+                                    println!(
+                                        "🗑️  Deleting {:?} ({}) - freeing {}...",
+                                        path, rule.description, size_str
+                                    );
+                                    match fs::remove_dir_all(path) {
+                                        Ok(_) => {
+                                            total_freed.fetch_add(size, Ordering::Relaxed);
+                                        }
+                                        Err(e) => println!("   FAILED to delete {:?}: {}", path, e),
+                                    }
+                                } else {
+                                    println!(
+                                        "[MATCH] Found {:<12} at {:?} ({}) - size: {}",
+                                        rule.folder_name, path, rule.description, size_str
+                                    );
+                                    total_freed.fetch_add(size, Ordering::Relaxed);
                                 }
-                                Err(e) => println!("FAILED: {}", e),
-                            }
-                        } else {
-                            println!(
-                                "[MATCH] Found {:<12} at {:?} ({})",
-                                rule.folder_name, path, rule.description
-                            );
-                        }
 
-                        // optimization: Don't scan inside folders we just deleted or marked for deletion
-                        walker.skip_current_dir();
-                        break; // Stop checking other rules for this folder
+                                return WalkState::Skip; // Don't scan inside the folder we just cleaned/found
+                            }
+                        }
                     }
                 }
-            }
-        }
-    }
+                WalkState::Continue
+            })
+        });
 
-    if !found_any {
+    let count = found_any.load(Ordering::Relaxed);
+    let bytes = total_freed.load(Ordering::Relaxed);
+
+    if count == 0 {
         println!("✨ Everything looks clean!");
-    } else if force {
-        println!("\n✅ Successfully cleaned {} folders.", total_cleaned);
+    } else {
+        if force {
+            println!("\n✅ Process complete.");
+            println!("🎉 Reclaimed space: {}", ByteSize(bytes).to_string());
+        } else {
+            println!(
+                "\n💡 Potential space to reclaim: {}",
+                ByteSize(bytes).to_string()
+            );
+        }
     }
 }

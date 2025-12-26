@@ -1,6 +1,12 @@
+use bytesize::ByteSize;
 use std::fs;
-use std::path::{Path};
+use std::path::Path;
 use walkdir::WalkDir;
+
+/// Simple heuristic: 4 chars ~= 1 token
+fn estimate_tokens(text: &str) -> usize {
+    text.chars().count() / 4
+}
 
 pub fn combine_code(
     root: &Path,
@@ -58,14 +64,11 @@ pub fn combine_code(
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_str().unwrap_or("");
 
-        // Always enter the root directory, even if it starts with '.' (like ".")
+        // Always enter the root directory
         if e.depth() == 0 {
             return true;
         }
 
-        // Skip hidden folders (starting with .) EXCEPT for config files we might want strictly at root
-        // But usually hidden folders like .git are ignored.
-        // We'll trust the explicit list + . starts.
         if name.starts_with('.') {
             return false;
         }
@@ -76,6 +79,10 @@ pub fn combine_code(
 
         true
     });
+
+    let mut total_files = 0;
+    let mut total_size = 0;
+    let mut total_tokens = 0;
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -136,6 +143,12 @@ pub fn combine_code(
                     // Try to make path relative to root for cleaner headers
                     let rel_path = path.strip_prefix(root).unwrap_or(path);
                     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                    let size = content.len();
+                    let tokens = estimate_tokens(&content);
+
+                    total_files += 1;
+                    total_size += size as u64;
+                    total_tokens += tokens;
 
                     let header = format!("\n# File: {}\n```{}\n", rel_path.display(), ext);
                     let footer = "\n```\n";
@@ -157,5 +170,9 @@ pub fn combine_code(
 
     if output_path.is_some() {
         println!("✅ Successfully combined code.");
+        println!("📊 Stats:");
+        println!("   Files: {}", total_files);
+        println!("   Total Size: {}", ByteSize(total_size).to_string());
+        println!("   Est. Tokens: {} (Heuristic: chars/4)", total_tokens);
     }
 }
